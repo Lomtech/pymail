@@ -11,7 +11,7 @@ Funktionen:
 - Optional-Spalten je Zeile:
     Betreff     : überschreibt globalen Betreff
     CC, BCC     : Kommagetrennt
-    AnhangPfad  : Ein oder mehrere Pfade, getrennt durch ; oder ,
+    AnhangPfad  : Ein oder mehrere Pfade, getrennt durch ; oder , (unterstützt Wildcards, Umgebungsvariablen, relative Pfade)
 - Dry-Run mit -dry für Vorschau ohne Versand.
 """
 
@@ -20,9 +20,9 @@ import os
 import re
 import sys
 import time
+import glob
 import pathlib
 from typing import Dict, List, Optional
-
 
 from openpyxl import load_workbook
 import win32com.client as win32
@@ -160,19 +160,79 @@ def parse_list_field(val: str) -> List[str]:
     if not val:
         return []
     parts = re.split(r"[;,]", val)
-    return [p.strip() for p in parts if p.strip()]
+    # Anführungszeichen/Whitespace entfernen
+    return [p.strip().strip('"').strip("'") for p in parts if p.strip()]
 
 
-def add_attachments(mail, field_value: str):
-    """Fügt Anhänge aus AnhangPfad hinzu (mehrere durch , oder ; getrennt)."""
-    paths = parse_list_field(field_value)
-    for p in paths:
-        fp = pathlib.Path(p)
-        if fp.exists() and fp.is_file():
-            mail.Attachments.Add(str(fp))
-        else:
-            print(f"[WARN] Anhang nicht gefunden: {p}", file=sys.stderr)
+# ------------------------ Intelligente Anhangsauflösung ------------------------
 
+def _resolve_attachment_candidates(raw: str, excel_dir: pathlib.Path) -> List[pathlib.Path]:
+    """
+    Liefert existierende Pfad-Kandidaten:
+      - Umgebungsvariablen/ ~ expandieren
+      - Absolutpfade direkt prüfen
+      - Relativ zu: excel_dir, BASE_DIR, CWD
+      - Wildcards (*.pdf) in denselben Basen
+      - Nur Dateiname → rekursiv in excel_dir suchen
+    """
+    raw_exp = os.path.expandvars(os.path.expanduser(raw.strip()))
+    p = pathlib.Path(raw_exp)
+
+    bases = [excel_dir, BASE_DIR, pathlib.Path.cwd()]
+    found: List[pathlib.Path] = []
+
+    has_glob = any(ch in raw_exp for ch in ["*", "?", "["])
+
+    # 1) Kein Glob → direkt prüfen
+    if not has_glob:
+        # absolut?
+        if p.is_absolute() and p.exists():
+            return [p]
+        # relativ zu Basen?
+        for b in bases:
+            cand = (b / p)
+            if cand.exists():
+                return [cand]
+
+    # 2) Glob → in Basen expandieren
+    if has_glob:
+        for b in bases:
+            for m in b.glob(raw_exp):
+                if m.exists():
+                    found.append(m)
+        if found:
+            return found
+
+    # 3) Nur Dateiname → rekursiv im Excel-Ordner
+    if p.name and not p.parent:
+        hits = list(excel_dir.rglob(p.name))
+        if hits:
+            return hits
+
+    return []
+
+
+def add_attachments(mail, field_value: str, excel_dir: pathlib.Path, warnf=print) -> List[pathlib.Path]:
+    """
+    Fügt Anhänge hinzu; akzeptiert mehrere Pfade, Wildcards, relative Pfade, Umgebungsvariablen.
+    Rückgabe: Liste der tatsächlich angehängten Pfade.
+    """
+    added: List[pathlib.Path] = []
+    for raw in parse_list_field(field_value):
+        cands = _resolve_attachment_candidates(raw, excel_dir)
+        if not cands:
+            warnf(f"[WARN] Anhang nicht gefunden: {raw}")
+            continue
+        for path in cands:
+            try:
+                mail.Attachments.Add(str(path))
+                added.append(path)
+            except Exception as e:
+                warnf(f"[WARN] Konnte Anhang nicht hinzufügen: {path} ({e})")
+    return added
+
+
+# ------------------------ Outlook-Senden ------------------------
 
 def send_outlook(
     to_addr: str,
@@ -182,6 +242,7 @@ def send_outlook(
     bcc: str = "",
     attachments: str = "",
     display: bool = False,
+    excel_dir: Optional[pathlib.Path] = None,
 ):
     outlook = win32.Dispatch("Outlook.Application")
     mail = outlook.CreateItem(0)  # olMailItem
@@ -194,7 +255,7 @@ def send_outlook(
     mail.HTMLBody = html
 
     if attachments:
-        add_attachments(mail, attachments)
+        add_attachments(mail, attachments, excel_dir or pathlib.Path.cwd(), warnf=lambda m: print(m, file=sys.stderr))
 
     if display:
         mail.Display(False)  # manuell prüfen
@@ -250,6 +311,7 @@ def main():
     # Pfade robust auflösen (CWD vs. EXE/Skript-Ordner)
     excel_path = resolve_path(args.excel, "Kundenliste.xlsx")
     template_path = resolve_path(args.template, "mail_template.html")
+    excel_dir = excel_path.parent.resolve()
 
     # Debug-Ausgaben (helfen bei 'Datei nicht gefunden')
     print(f"[DEBUG] BASE_DIR={BASE_DIR}")
@@ -332,15 +394,31 @@ def main():
         attach_raw = c.get("anhangpfad", "") or c.get("anhang", "")
 
         if args.dry:
-            print(
-                f"\n--- DRY RUN #{i} ---"
-                f"\nTO: {email}"
-                f"\nSUBJECT: {subject or '(leer)'}"
-                f"\nCC: {cc_raw}"
-                f"\nBCC: {bcc_raw}"
-                f"\nANHANG: {attach_raw}"
-                f"\nHTML:\n{html}\n"
-            )
+            # Im Dry-Run die aufgelösten Anhänge anzeigen
+            if attach_raw:
+                resolved = []
+                for raw in parse_list_field(attach_raw):
+                    resolved += [str(p) for p in _resolve_attachment_candidates(raw, excel_dir)]
+                print(
+                    f"\n--- DRY RUN #{i} ---"
+                    f"\nTO: {email}"
+                    f"\nSUBJECT: {subject or '(leer)'}"
+                    f"\nCC: {cc_raw}"
+                    f"\nBCC: {bcc_raw}"
+                    f"\nANHANG (Roh): {attach_raw}"
+                    f"\nANHANG (gefunden): {resolved if resolved else '—'}"
+                    f"\nHTML (gekürzt):\n{html[:800]}{'…' if len(html)>800 else ''}\n"
+                )
+            else:
+                print(
+                    f"\n--- DRY RUN #{i} ---"
+                    f"\nTO: {email}"
+                    f"\nSUBJECT: {subject or '(leer)'}"
+                    f"\nCC: {cc_raw}"
+                    f"\nBCC: {bcc_raw}"
+                    f"\nANHANG: —"
+                    f"\nHTML (gekürzt):\n{html[:800]}{'…' if len(html)>800 else ''}\n"
+                )
             continue
 
         try:
@@ -352,6 +430,7 @@ def main():
                 bcc=bcc_raw,
                 attachments=attach_raw,
                 display=args.display,
+                excel_dir=excel_dir,
             )
             sent += 1
             print(f"[OK] {i}/{len(contacts)} → {email}")
